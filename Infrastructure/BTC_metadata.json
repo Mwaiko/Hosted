@@ -1,0 +1,77 @@
+{
+  "training_timestamp": "2025-08-28T16:33:31",
+  "regime_count": 3,
+  "total_models_saved": 4,
+  "active_regimes": [
+    0,
+    1,
+    2
+  ],
+  "regime_statistics": {
+    "0": {
+      "size": "2450",
+      "positive_rate": 0.5004081632653061,
+      "target_distribution": "[1224 1226]"
+    },
+    "1": {
+      "size": "2118",
+      "positive_rate": 0.47592067988668557,
+      "target_distribution": "[1110 1008]"
+    },
+    "2": {
+      "size": "1956",
+      "positive_rate": 0.5168711656441718,
+      "target_distribution": "[ 945 1011]"
+    }
+  },
+  "model_architecture_summary": {
+    "regime_0": {
+      "layers": 7,
+      "parameters": 13057,
+      "input_shape": [
+        null,
+        20
+      ],
+      "output_shape": [
+        null,
+        1
+      ]
+    },
+    "regime_1": {
+      "layers": 7,
+      "parameters": 13057,
+      "input_shape": [
+        null,
+        20
+      ],
+      "output_shape": [
+        null,
+        1
+      ]
+    },
+    "regime_2": {
+      "layers": 7,
+      "parameters": 13057,
+      "input_shape": [
+        null,
+        20
+      ],
+      "output_shape": [
+        null,
+        1
+      ]
+    },
+    "global": {
+      "layers": 9,
+      "parameters": 48641,
+      "input_shape": [
+        null,
+        20
+      ],
+      "output_shape": [
+        null,
+        1
+      ]
+    }
+  }
+}

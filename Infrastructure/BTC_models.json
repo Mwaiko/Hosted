@@ -1,0 +1,6 @@
+{
+  "regime_0": "Infrastructure/BTC_regime_0.keras",
+  "regime_1": "Infrastructure/BTC_regime_1.keras",
+  "regime_2": "Infrastructure/BTC_regime_2.keras",
+  "global": "Infrastructure/BTC_global.keras"
+}
