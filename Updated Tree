@@ -1,0 +1,378 @@
+got it — here’s a clean, detailed plan for a **HybridRegimePipeline** that does exactly what you describe:
+
+# HybridRegimePipeline (RF → KMeans-on-Trees → Per-Regime NNs)
+
+## 0) Goal (quick)
+
+* Train a **Random Forest** on intraday BTC-USD features to get strong, diverse “micro-alphas”.
+* **Cluster the trees** (not the samples) with **KMeans** so each cluster becomes a “regime expert” subset of trees (e.g., trend, mean-reversion, chop).
+* For **each tree-cluster (regime)**, train a **small Neural Network** specialized for that regime.
+* At **inference**, assign each new sample to a **regime** using the forest’s tree-level outputs, then route to the matching NN. Use clear boundaries + a confidence threshold so regime ID is stable and unambiguous.
+
+---
+
+## 1) Data + Labels
+
+**Inputs:** `X` of shape `(n_samples, n_features)` with strictly *causal* technical indicators (no look-ahead).
+**Targets:**
+
+* Classification (e.g., next-horizon direction: buy/sell/flat), or
+* Regression (e.g., next-horizon log-return).
+
+**Do:**
+
+* Align labels with a fixed horizon (e.g., next 30m return).
+* Purge/embargo around events to avoid leakage if you use overlapping windows.
+* Split by **time**: walk-forward CV (e.g., `train:val:test = [2019–2022] : [2023H1] : [2023H2–2024]`), no shuffling.
+
+---
+
+## 2) Train the Random Forest (RF)
+
+* `RandomForestClassifier` (classification) or `RandomForestRegressor` (regression).
+* Recommended: many shallow-ish trees to maximize diversity.
+
+  * `n_estimators: 300–1000`, `max_depth: 4–8`, `min_samples_leaf: 50–200`, `max_features: sqrt` or a fraction.
+* Fit on **train**; reserve a **calibration** slice (last 10–20% of train) for tree representations (below).
+
+---
+
+## 3) Represent Each Tree (so we can cluster **trees**)
+
+Build a vector that characterizes each tree’s behavior. Good, robust choices:
+
+**A. Prediction profile (preferred):**
+For each tree `t`, predict on the calibration set to get a vector `p_t ∈ R^{N_cal}`:
+
+* Classification: class probability of “buy” (or logits).
+* Regression: predicted return (z-scored).
+
+**B. (Optional, to concatenate)** Tree metadata vector:
+
+* Normalized feature importances (length = n\_features).
+* Distributional stats of leaf outputs on calibration (mean, variance, skew).
+
+**Final tree embedding:**
+`E_t = concat( normalize(p_t), α * normalized_importances, β * stats )`
+Choose `α, β` small (e.g., 0.1) so prediction profile dominates.
+
+---
+
+## 4) KMeans: Cluster the Trees → Regimes
+
+* Run **KMeans** on `{E_t}` (t = 1..n\_trees).
+* Choose `K` via silhouette/BIC over `K ∈ {2..6}`; fix `random_state` for stability.
+* Output:
+
+  * `cluster_id[t] ∈ {0..K-1}` for each tree.
+  * Cluster sizes (avoid tiny clusters; if a cluster < 5% of trees, merge to nearest centroid).
+
+**Interpretation:** each cluster = subset of trees that “behave similarly” on calibration → a “regime expert”.
+
+---
+
+## 5) Define a **Regime Assignment Rule** (clear boundaries)
+
+For a new sample `x`, get per-tree predictions:
+
+* Classification: per-tree prob of “buy” (or class logit).
+* Regression: per-tree predicted return.
+
+Aggregate **within cluster c**:
+
+* `μ_c(x) = mean_{t in cluster c} yhat_t(x)` (probability or return)
+* `σ_c(x) = std_{t in cluster c} yhat_t(x)` (uncertainty proxy)
+* For classification define **decisiveness**:
+
+  * `D_c(x) = | μ_c(x) - 0.5 |` (how far from indecision)
+* For regression define **strength**:
+
+  * `S_c(x) = | μ_c(x) / (σ_c(x)+ε) |` (signal-to-uncertainty)
+
+**Hard regime selection:**
+
+* If classification: pick `c* = argmax_c D_c(x)`
+* If regression: pick `c* = argmax_c S_c(x)`
+
+**Confidence & “no-man’s-land”:**
+
+* Require `max_c D_c(x) ≥ τ` (e.g., `τ=0.1`) or `max_c S_c(x) ≥ τ_r`.
+* If below threshold → **Ambiguous**: route to a **Global NN** (fallback) or skip trade.
+* This threshold creates **clear boundaries** and avoids jittery regime flips.
+
+**Stability trick:** exponential moving average (EMA) of regime over last `m` bars (small, e.g., 3–5) before switching, unless confidence improves by a margin. That locks identification.
+
+---
+
+## 6) Build Per-Regime Training Sets
+
+On the **training** timeline only (no leakage):
+
+For each sample in train:
+
+1. Compute regime assignment using the *trained RF* & rule above (applied causally).
+2. Add `(x, y)` to that regime’s dataset `D_c`.
+
+Handle class imbalance per regime (class weights or focal loss).
+
+---
+
+## 7) Train a **Neural Network per Regime**
+
+**Architecture (simple & robust):**
+
+* Input: original `X` (same `(n_features,)`), optionally plus a few RF meta-features (e.g., `μ_c(x)`, `σ_c(x)` for the selected cluster as extra inputs).
+* MLP: `Dense(128) → BN → LeakyReLU → Dropout(0.2) → Dense(64) → BN → LeakyReLU → Dropout(0.2) → Output`
+* Classification: `sigmoid` (binary) or `softmax` (multi-class).
+* Regression: linear output; optimize MSE/Huber.
+
+**Training:**
+
+* Early stopping on **val** (time split).
+* Calibrate probabilities (Platt/Temperature scaling) on a **calibration** slice *per regime*.
+* Save: scaler(s), RF, KMeans, regime\_thresholds, and each regime-NN.
+
+**Global fallback NN**
+Train the same MLP on **all** training samples for ambiguous cases.
+
+---
+
+## 8) Inference / Live Trading
+
+For each new `x_t` (bar t):
+
+1. **Preprocess**: scale/transform using fitted scalers.
+2. **RF pass**: get per-tree predictions; compute `{μ_c(x_t), σ_c(x_t)}` for all clusters.
+3. **Regime select**: apply decisiveness/strength + threshold:
+
+   * If confident → pick regime `c*`; else use **Global NN** or no-trade.
+4. **NN prediction**: use NN for `c*` (or global) to get final **signal** (buy/sell/hold or return).
+5. **Post-trade rules**:
+
+   * Slippage/fees baked in.
+   * Risk controls: position sizing by Kelly-fraction cap or volatility targeting; hard stops/TTLs; max concurrent exposure.
+6. **Logging**: store `(t, regime, confidence, prediction, realized)` for monitoring.
+
+---
+
+## 9) Validation & Backtest (walk-forward)
+
+* **Walk-forward** windows: repeatedly (fit → cluster → per-regime train → test).
+* Metrics:
+
+  * Classification: precision/recall by regime, Brier score, ECE.
+  * Trading: net PnL after fees, CAGR, Sharpe, Sortino, max DD, turnover, hit rate, average win/loss, tail (5% VaR/ES).
+* **Regime stability checks**:
+
+  * % time spent in each regime.
+  * **Flip rate** (regime changes per day) — should be moderate.
+  * **Confidence histogram** — ensure most routed decisions are above τ.
+* **Cluster quality**:
+
+  * Silhouette score on tree embeddings.
+  * Contribution analysis: PnL attribution by regime cluster.
+
+---
+
+## 10) Drift & Maintenance
+
+* **Fixed KMeans**: keep centroids from last full retrain; allow *light* centroid EMA updates on recent calibration to track slow drift (with cap).
+* **Mapping stability**: keep the **cluster label order** constant across retrains by matching centroids (Hungarian matching on distances) — prevents regime ID renumbering.
+* **OOS guardrails**: OOD detector (e.g., Mahalanobis on feature space or RF-leaf hash density). If OOD, route to Global NN / flat.
+
+---
+
+## 11) Class Skeleton (concise)
+
+```python
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import tensorflow as tf
+from tensorflow.keras import layers, callbacks, optimizers, models
+
+class HybridRegimePipeline:
+    """
+    RF -> KMeans-on-Tree-Embeddings -> Per-Regime NNs with clear regime assignment.
+    """
+
+    def __init__(self, *, task="classification", n_trees=600, max_depth=6,
+                 k_candidates=(2,3,4), decisiveness_tau=0.10, seed=42):
+        self.task = task
+        self.rf = RandomForestClassifier(
+            n_estimators=n_trees, max_depth=max_depth,
+            min_samples_leaf=100, max_features='sqrt',
+            random_state=seed, n_jobs=-1
+        )
+        self.k_candidates = k_candidates
+        self.decisiveness_tau = decisiveness_tau
+        self.seed = seed
+        self.scaler = StandardScaler()
+        self.kmeans = None
+        self.tree_cluster_ids = None
+        self.regime_models = {}  # c -> keras.Model
+        self.global_model = None
+
+    # ---------- TRAIN ----------
+    def fit(self, X_train, y_train, X_calib, y_calib, X_val=None, y_val=None):
+        X_train_s = self.scaler.fit_transform(X_train)
+        self.rf.fit(X_train_s, y_train)
+
+        # Build tree embeddings on calibration slice
+        Xc_s = self.scaler.transform(X_calib)
+        tree_embs = self._build_tree_embeddings(Xc_s, y_calib)
+
+        # Choose K and cluster trees
+        self.kmeans, self.tree_cluster_ids = self._cluster_trees(tree_embs)
+
+        # Assign regimes on TRAIN (causal) and assemble per-regime datasets
+        reg_ids_train, conf_train = self._assign_regimes_batch(X_train_s)
+        datasets = self._split_by_regime(X_train_s, y_train, reg_ids_train, conf_train)
+
+        # Train per-regime NNs
+        for c, (Xc, yc) in datasets.items():
+            self.regime_models[c] = self._build_and_train_nn(Xc, yc, X_val, y_val)
+
+        # Global fallback
+        self.global_model = self._build_and_train_nn(X_train_s, y_train, X_val, y_val)
+
+    # ---------- INFERENCE ----------
+    def predict(self, X):
+        Xs = self.scaler.transform(X)
+        reg_ids, confs = self._assign_regimes_batch(Xs)
+        preds = []
+        for i, x in enumerate(Xs):
+            c = reg_ids[i]
+            model = self.regime_models.get(c, self.global_model)
+            p = model.predict(x[None, :], verbose=0)
+            preds.append(p[0])
+        return np.array(preds), reg_ids, confs
+
+    # ---------- INTERNALS ----------
+    def _build_tree_embeddings(self, Xc_s, y_calib):
+        # For each tree, prediction profile vector on calibration set
+        ests = self.rf.estimators_
+        embs = []
+        for est in ests:
+            if self.task == "classification":
+                p = est.predict_proba(Xc_s)[:, 1]
+            else:
+                p = est.predict(Xc_s)
+                p = (p - p.mean()) / (p.std() + 1e-8)
+            embs.append(p)
+        E = np.stack(embs, axis=0)     # shape: (n_trees, N_cal)
+        # Optionally concat normalized feature importances
+        # FI = np.stack([est.feature_importances_ for est in ests], axis=0)
+        # E = np.concatenate([E, 0.1 * (FI / (FI.sum(axis=1, keepdims=True)+1e-8))], axis=1)
+        return E
+
+    def _cluster_trees(self, E):
+        best_km, best_ids, best_score = None, None, -np.inf
+        for k in self.k_candidates:
+            km = KMeans(n_clusters=k, n_init=20, random_state=self.seed)
+            ids = km.fit_predict(E)
+            score = silhouette_score(E, ids)
+            if score > best_score:
+                best_km, best_ids, best_score = km, ids, score
+        return best_km, best_ids
+
+    def _assign_regimes_batch(self, Xs):
+        # Aggregate per-tree predictions by cluster and compute decisiveness per sample
+        ests = self.rf.estimators_
+        C = self.kmeans.n_clusters
+        # Precompute per-tree cluster id
+        tree2c = self.tree_cluster_ids
+        mu = np.zeros((Xs.shape[0], C))
+
+        # Efficient per-tree loop
+        for t, est in enumerate(ests):
+            if self.task == "classification":
+                pt = est.predict_proba(Xs)[:, 1]
+            else:
+                pt = est.predict(Xs)
+            mu[:, tree2c[t]] += pt
+
+        # Average within each cluster (by cluster size)
+        counts = np.bincount(tree2c, minlength=C).astype(float)
+        mu = mu / counts[None, :]
+
+        if self.task == "classification":
+            decisiveness = np.abs(mu - 0.5)
+            conf = decisiveness.max(axis=1)
+            reg = decisiveness.argmax(axis=1)
+            # apply threshold: if low confidence, route to -1 (global)
+            reg[conf < self.decisiveness_tau] = -1
+            return reg, conf
+        else:
+            # For regression you might also track std by second pass; here use |mu| proxy
+            strength = np.abs(mu)
+            conf = strength.max(axis=1)
+            reg = strength.argmax(axis=1)
+            reg[conf < self.decisiveness_tau] = -1
+            return reg, conf
+
+    def _split_by_regime(self, Xs, y, reg_ids, conf, min_conf=None):
+        if min_conf is None: min_conf = self.decisiveness_tau
+        datasets = {}
+        for c in range(self.kmeans.n_clusters):
+            idx = np.where((reg_ids == c) & (conf >= min_conf))[0]
+            if len(idx) > 0:
+                datasets[c] = (Xs[idx], y[idx])
+        return datasets
+
+    def _build_and_train_nn(self, X, y, X_val=None, y_val=None):
+        inp = layers.Input(shape=(X.shape[1],))
+        x = layers.Dense(128)(inp); x = layers.BatchNormalization()(x)
+        x = layers.LeakyReLU()(x); x = layers.Dropout(0.2)(x)
+        x = layers.Dense(64)(x); x = layers.BatchNormalization()(x)
+        x = layers.LeakyReLU()(x); x = layers.Dropout(0.2)(x)
+
+        if self.task == "classification":
+            out = layers.Dense(1, activation="sigmoid")(x)
+            loss = "binary_crossentropy"; metrics = ["AUC", "Precision", "Recall"]
+        else:
+            out = layers.Dense(1, activation="linear")(x)
+            loss = "mse"; metrics = []
+
+        model = models.Model(inp, out)
+        model.compile(optimizer=optimizers.Adam(1e-3), loss=loss, metrics=metrics)
+
+        cbs = [callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)]
+        if X_val is not None and y_val is not None:
+            model.fit(X, y, validation_data=(X_val, y_val), epochs=200, batch_size=256, callbacks=cbs, verbose=0)
+        else:
+            model.fit(X, y, epochs=50, batch_size=256, verbose=0)
+        return model
+```
+
+> Notes:
+>
+> * For TensorFlow/Keras 3 environments, importing via `tensorflow.keras` (as above) avoids the common `keras.saving` import errors.
+> * For a regressor version, switch the RF/NN heads accordingly and use the regression strength criterion.
+
+---
+
+## 12) Practical Tips (so it “just works”)
+
+* **Feature set:** combine price-based TA (OHLCV, returns, vol, ATR, RSI, MACD components), microstructure (spread/proxy, imbalance), and time-of-day flags. Keep it modest; let RF discover interactions.
+* **Costs:** subtract realistic fees + slippage in backtests (e.g., 1–3 bps per trade each way on majors).
+* **Turnover controls:** skip trades if signal magnitude < threshold; cool-down window after a stop.
+* **Calibration:** after training each per-regime NN, do probability calibration on a held-out slice (classification) so thresholds map to real hit rates.
+* **Monitoring:** track regime time share, flip rate, average confidence, and per-regime PnL attribution; alert if a regime’s performance collapses → trigger retrain.
+
+---
+
+## 13) (Optional) Alternative: **Cluster samples** via RF leaf embeddings
+
+If you ever want even sharper regime boundaries:
+
+* Use `RF.apply(X)` → leaf indices per tree → one-hot/hash into a sparse vector (tree-leaf embedding).
+* KMeans (or MiniBatchKMeans) on these **sample embeddings** to get **sample-level regimes**.
+* Then train per-regime NNs as above.
+  **Pros:** very crisp regime mapping. **Cons:** heavier, requires careful regularization and periodic remapping.
+
+---
+
+If you want, I can tailor the skeleton to **your exact label definition** (classification vs regression), add **walk-forward backtest code**, and include **signal→position sizing** logic (vol targeting / Kelly cap) in the class.
